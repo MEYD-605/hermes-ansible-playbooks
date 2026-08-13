@@ -1,0 +1,27 @@
+# Ansible runtime
+*.retry
+*.log
+.vault_pass
+.vault_password
+vault_pass.txt
+
+# Real inventory / secrets — never commit these
+inventory/hosts.ini
+inventory/hosts.yml
+group_vars/all.yml
+group_vars/*.secret.yml
+host_vars/
+*.pem
+*.key
+id_rsa
+id_ed25519
+
+# Local overrides
+ansible.cfg.local
+.venv/
+__pycache__/
+.DS_Store
+
+# Temp skill archives produced by playbooks
+/tmp/hermes_fleet_skills.tar.gz
+hermes_fleet_skills.tar.gz

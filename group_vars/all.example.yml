@@ -1,0 +1,48 @@
+---
+# Copy to group_vars/all.yml (gitignored) and edit.
+# Nothing in this file is a secret. Put tokens in a vault or the
+# seat's own ~/.hermes-<seat>/.env — never in playbooks.
+
+# --- Job A: fresh Linux node ---
+hermes_user: hermes
+hermes_group: hermes
+hermes_repo_url: "https://github.com/NousResearch/hermes-agent.git"
+hermes_repo_version: main
+python_version: "3.11"
+node_version: "22"
+skip_browser: false
+
+# Where the controller (the machine running ansible-playbook) keeps
+# the fleet skill tree that Stage 04b copies onto the new node.
+# Default assumes you already run a Hermes seat locally.
+controller_skills_dir: "{{ lookup('env', 'HOME') }}/.hermes-gmgrok/skills"
+
+# Skill categories to ship. Drop any you do not want on a new node.
+fleet_skill_dirs:
+  - oracle-fleet
+  - gm-standard
+  - fleet
+  - bo-dm-protocol
+  - discord-fleet
+  - autonomous-ai-agents
+  - github
+  - devops
+
+# --- Job B / C: macOS multi-seat host ---
+admin_user: "{{ lookup('env', 'USER') | default('admin', true) }}"
+admin_home: "{{ lookup('env', 'HOME') }}"
+hermes_shared_repo: "{{ admin_home }}/Code/github.com/NousResearch/hermes-agent"
+
+# Seats that exist as ~/.hermes-<name> directories (perm / .env only)
+hermes_profiles_all:
+  - example-seat
+
+# Seats that already have a real venv (config-set / skills tasks)
+hermes_profiles_with_venv:
+  - example-seat
+
+# Optional local probes. Off by default so a public clone does not
+# fail because your lab is not running these services.
+firecrawl_required: false
+arra_required: false
+arra_url: "http://127.0.0.1:47778/api/stats"

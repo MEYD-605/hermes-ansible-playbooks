@@ -1,0 +1,278 @@
+---
+# Job A — provision a brand-new Linux Hermes node.
+#
+# One machine, one dedicated UNIX user, one systemd gateway.
+# Do NOT run this against a macOS multi-seat host (use
+# deploy-hermes-seat-macos.yml / macos-fleet-hygiene.yml instead).
+#
+# Usage:
+#   cp inventory/hosts.example.ini inventory/hosts.ini
+#   cp group_vars/all.example.yml group_vars/all.yml
+#   ansible-galaxy collection install -r requirements.yml
+#   ansible -i inventory/hosts.ini hermes_nodes -m ping
+#   ansible-playbook playbooks/deploy-hermes-node.yml
+#
+# --check is a preview, not a pass/fail gate. apt→service chains and
+# every command/shell task are skipped in check mode.
+
+- name: Provision and Deploy Hermes Agent Node
+  hosts: hermes_nodes
+  become: true
+  vars:
+    hermes_user: hermes
+    hermes_group: hermes
+    hermes_home: "/home/{{ hermes_user }}"
+    hermes_repo_url: "https://github.com/NousResearch/hermes-agent.git"
+    hermes_repo_version: "main"
+    hermes_install_dir: "{{ hermes_home }}/.hermes/hermes-agent"
+    hermes_venv_dir: "{{ hermes_install_dir }}/venv"
+    hermes_bin_dir: "{{ hermes_home }}/.local/bin"
+    python_version: "3.11"
+    skip_browser: false
+    controller_skills_dir: "{{ lookup('env', 'HOME') }}/.hermes-gmgrok/skills"
+    fleet_skill_dirs:
+      - oracle-fleet
+      - gm-standard
+      - fleet
+      - bo-dm-protocol
+      - discord-fleet
+      - autonomous-ai-agents
+      - github
+      - devops
+
+  tasks:
+    # -----------------------------------------------------------------
+    # 00: User & System Setup
+    # -----------------------------------------------------------------
+    - name: Ensure hermes service group exists
+      ansible.builtin.group:
+        name: "{{ hermes_group }}"
+        state: present
+
+    - name: Ensure hermes service user exists
+      ansible.builtin.user:
+        name: "{{ hermes_user }}"
+        group: "{{ hermes_group }}"
+        shell: /bin/bash
+        home: "{{ hermes_home }}"
+        create_home: true
+        state: present
+
+    - name: Install system dependencies (Debian/Ubuntu)
+      ansible.builtin.apt:
+        name:
+          - git
+          - curl
+          - xz-utils
+          - build-essential
+          - python3-pip
+          - python3-venv
+          - ffmpeg
+          - ripgrep
+        state: present
+        update_cache: true
+      when: ansible_os_family == "Debian"
+
+    # -----------------------------------------------------------------
+    # 01: System Hardening (fail2ban)
+    # -----------------------------------------------------------------
+    - name: Install fail2ban
+      ansible.builtin.apt:
+        name: fail2ban
+        state: present
+      when: ansible_os_family == "Debian"
+
+    - name: Ensure fail2ban service is active and enabled
+      ansible.builtin.service:
+        name: fail2ban
+        state: started
+        enabled: true
+
+    # -----------------------------------------------------------------
+    # 02: Toolchain (uv, Playwright system deps)
+    # -----------------------------------------------------------------
+    - name: Download uv installer script (astral.sh) for hermes user
+      ansible.builtin.get_url:
+        url: https://astral.sh/uv/install.sh
+        dest: "/tmp/uv-install-{{ hermes_user }}.sh"
+        mode: "0755"
+      become: true
+      become_user: "{{ hermes_user }}"
+
+    - name: Run uv installer for hermes user
+      ansible.builtin.command:
+        cmd: "sh /tmp/uv-install-{{ hermes_user }}.sh"
+        creates: "{{ hermes_home }}/.local/bin/uv"
+      become: true
+      become_user: "{{ hermes_user }}"
+
+    - name: Install Playwright system dependencies for Chromium
+      ansible.builtin.command:
+        cmd: npx -y playwright install-deps chromium
+      when: not skip_browser
+      changed_when: true
+
+    # -----------------------------------------------------------------
+    # 03: Repository & Virtual Environment
+    # -----------------------------------------------------------------
+    - name: Ensure target directories exist with proper permissions
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ hermes_user }}"
+        group: "{{ hermes_group }}"
+        mode: "0755"
+      loop:
+        - "{{ hermes_home }}/.hermes"
+        - "{{ hermes_home }}/.local/bin"
+
+    - name: Checkout Hermes Agent repository
+      ansible.builtin.git:
+        repo: "{{ hermes_repo_url }}"
+        dest: "{{ hermes_install_dir }}"
+        version: "{{ hermes_repo_version }}"
+        update: true
+      become: true
+      become_user: "{{ hermes_user }}"
+
+    - name: Create venv and install Hermes via uv
+      ansible.builtin.shell: |
+        set -euo pipefail
+        export UV_NO_CONFIG=1
+        {{ hermes_home }}/.local/bin/uv venv {{ hermes_venv_dir }} --python {{ python_version }}
+        {{ hermes_home }}/.local/bin/uv pip install --python {{ hermes_venv_dir }} -e ".[all]"
+      args:
+        chdir: "{{ hermes_install_dir }}"
+        creates: "{{ hermes_venv_dir }}/bin/hermes"
+      become: true
+      become_user: "{{ hermes_user }}"
+
+    - name: Symlink hermes CLI to user local bin
+      ansible.builtin.file:
+        src: "{{ hermes_venv_dir }}/bin/hermes"
+        dest: "{{ hermes_bin_dir }}/hermes"
+        state: link
+        owner: "{{ hermes_user }}"
+        group: "{{ hermes_group }}"
+
+    - name: Symlink hermes CLI system-wide
+      ansible.builtin.file:
+        src: "{{ hermes_venv_dir }}/bin/hermes"
+        dest: /usr/local/bin/hermes
+        state: link
+
+    # -----------------------------------------------------------------
+    # 04: Systemd Service
+    # -----------------------------------------------------------------
+    - name: Install Hermes Gateway systemd service unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/hermes-gateway.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Hermes Agent Gateway Service
+          After=network.target
+
+          [Service]
+          Type=simple
+          User={{ hermes_user }}
+          Group={{ hermes_group }}
+          WorkingDirectory={{ hermes_install_dir }}
+          Environment="PATH={{ hermes_bin_dir }}:{{ hermes_home }}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+          Environment="HERMES_HOME={{ hermes_home }}/.hermes"
+          ExecStart={{ hermes_venv_dir }}/bin/hermes gateway run
+          Restart=always
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Reload systemd
+
+    - name: Ensure Hermes Gateway service is started and enabled
+      ansible.builtin.systemd:
+        name: hermes-gateway.service
+        state: started
+        enabled: true
+
+    # -----------------------------------------------------------------
+    # 04b: Fleet skills (optional — skipped if controller has none)
+    # -----------------------------------------------------------------
+    - name: Ensure Hermes skills directory exists
+      ansible.builtin.file:
+        path: "{{ hermes_home }}/.hermes/skills"
+        state: directory
+        owner: "{{ hermes_user }}"
+        group: "{{ hermes_group }}"
+        mode: "0755"
+
+    - name: Check whether the controller has a fleet skill tree
+      ansible.builtin.stat:
+        path: "{{ controller_skills_dir }}"
+      register: controller_skills
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Create skills archive on the controller
+      community.general.archive:
+        path: "{{ fleet_skill_dirs | map('regex_replace', '^', controller_skills_dir + '/') | list }}"
+        dest: /tmp/hermes_fleet_skills.tar.gz
+        format: gz
+        mode: "0644"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      when: controller_skills.stat.exists | default(false)
+
+    - name: Copy skills archive to the remote node
+      ansible.builtin.copy:
+        src: /tmp/hermes_fleet_skills.tar.gz
+        dest: /tmp/hermes_fleet_skills.tar.gz
+        mode: "0644"
+      when: controller_skills.stat.exists | default(false)
+
+    - name: Extract fleet skills into Hermes skills directory
+      ansible.builtin.unarchive:
+        src: /tmp/hermes_fleet_skills.tar.gz
+        dest: "{{ hermes_home }}/.hermes/skills/"
+        remote_src: true
+        owner: "{{ hermes_user }}"
+        group: "{{ hermes_group }}"
+      when: controller_skills.stat.exists | default(false)
+
+    - name: Pin mcp SDK to v1.x (mcp 2.0.0 breaks Hermes 0.19.x)
+      ansible.builtin.pip:
+        name: "mcp==1.28.1"
+        virtualenv: "{{ hermes_venv_dir }}"
+        state: present
+
+    - name: Count provisioned SKILL.md files
+      ansible.builtin.find:
+        paths: "{{ hermes_home }}/.hermes/skills"
+        patterns: "SKILL.md"
+        recurse: true
+      register: skills_found
+
+    - name: Show skills count
+      ansible.builtin.debug:
+        msg: "Fleet skills provisioned: {{ skills_found.matched }} SKILL.md files"
+
+    # -----------------------------------------------------------------
+    # 05: Verification
+    # -----------------------------------------------------------------
+    - name: Verify Hermes Agent installation (hermes doctor)
+      ansible.builtin.command:
+        cmd: "{{ hermes_bin_dir }}/hermes doctor"
+      become: true
+      become_user: "{{ hermes_user }}"
+      register: hermes_doctor_output
+      changed_when: false
+
+    - name: Display doctor output summary
+      ansible.builtin.debug:
+        var: hermes_doctor_output.stdout_lines
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true

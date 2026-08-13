@@ -1,0 +1,223 @@
+---
+# Job B — config hygiene on an EXISTING macOS multi-seat host.
+#
+# This is not disaster recovery and not a fresh-node install.
+# It loops idempotent tasks across ~/.hermes-<seat>/ to keep
+# permissions, compression defaults, and optional local probes
+# consistent.
+#
+# Usage:
+#   cp group_vars/all.example.yml group_vars/all.yml
+#   # edit hermes_profiles_* to match `ls ~/.hermes-*`
+#   ansible-playbook playbooks/macos-fleet-hygiene.yml
+#
+# --check SILENTLY SKIPS every command/shell task. A clean check
+# pass proves nothing about stages 03/04/07/08. Always verify with
+# a real run, then grep the target config.yaml yourself.
+
+- name: macOS Hermes multi-seat fleet hygiene
+  hosts: macos_hermes_hosts
+  connection: local
+  gather_facts: true
+  vars:
+    home_dir: "{{ lookup('env', 'HOME') }}"
+    controller_skills_dir: "{{ home_dir }}/.hermes-gmgrok/skills"
+    fleet_skill_dirs:
+      - oracle-fleet
+      - gm-standard
+      - fleet
+      - bo-dm-protocol
+      - discord-fleet
+      - autonomous-ai-agents
+      - github
+      - devops
+    hermes_profiles_all:
+      - example-seat
+    hermes_profiles_with_venv:
+      - example-seat
+    firecrawl_required: false
+    arra_required: false
+    arra_url: "http://127.0.0.1:47778/api/stats"
+    idle_compact_after_seconds: "1800"
+    compression_threshold: "0.3"
+
+  tasks:
+    # ── Stage 00: paths ──
+    - name: "00-user | Ensure local bin directory exists"
+      ansible.builtin.file:
+        path: "{{ home_dir }}/.local/bin"
+        state: directory
+        mode: "0755"
+
+    # ── Stage 01: per-seat home perms ──
+    - name: "01-security | Tighten ~/.hermes-<seat> to 0700"
+      ansible.builtin.file:
+        path: "{{ home_dir }}/.hermes-{{ item }}"
+        state: directory
+        mode: "0700"
+      loop: "{{ hermes_profiles_all }}"
+
+    # ── Stage 04: hermes config hygiene ──
+    # command + environment: — never prefix VAR=val inside cmd.
+    - name: "04-hermes-config | Read idle_compact_after_seconds"
+      ansible.builtin.command:
+        cmd: "{{ home_dir }}/.hermes-{{ item }}/venv/bin/python -m hermes_cli.main config get compression.idle_compact_after_seconds"
+      environment:
+        HERMES_HOME: "{{ home_dir }}/.hermes-{{ item }}"
+      loop: "{{ hermes_profiles_with_venv }}"
+      register: current_idle_compact
+      changed_when: false
+      failed_when: false
+
+    - name: "04-hermes-config | Enforce idle_compact_after_seconds"
+      ansible.builtin.command:
+        cmd: "{{ home_dir }}/.hermes-{{ item }}/venv/bin/python -m hermes_cli.main config set compression.idle_compact_after_seconds {{ idle_compact_after_seconds }}"
+      environment:
+        HERMES_HOME: "{{ home_dir }}/.hermes-{{ item }}"
+      loop: "{{ hermes_profiles_with_venv }}"
+      loop_control:
+        index_var: profile_idx
+      register: config_idle_compact
+      changed_when: current_idle_compact.results[profile_idx].stdout | default('') | trim != idle_compact_after_seconds
+      failed_when: config_idle_compact.rc != 0
+
+    - name: "04-hermes-config | Read compression.threshold"
+      ansible.builtin.command:
+        cmd: "{{ home_dir }}/.hermes-{{ item }}/venv/bin/python -m hermes_cli.main config get compression.threshold"
+      environment:
+        HERMES_HOME: "{{ home_dir }}/.hermes-{{ item }}"
+      loop: "{{ hermes_profiles_with_venv }}"
+      register: current_threshold
+      changed_when: false
+      failed_when: false
+
+    - name: "04-hermes-config | Enforce compression.threshold"
+      ansible.builtin.command:
+        cmd: "{{ home_dir }}/.hermes-{{ item }}/venv/bin/python -m hermes_cli.main config set compression.threshold {{ compression_threshold }}"
+      environment:
+        HERMES_HOME: "{{ home_dir }}/.hermes-{{ item }}"
+      loop: "{{ hermes_profiles_with_venv }}"
+      loop_control:
+        index_var: profile_idx
+      register: config_threshold
+      changed_when: current_threshold.results[profile_idx].stdout | default('') | trim != compression_threshold
+      failed_when: config_threshold.rc != 0
+
+    - name: "04-hermes-config | Read tool_loop_guardrails.hard_stop_enabled"
+      ansible.builtin.command:
+        cmd: "{{ home_dir }}/.hermes-{{ item }}/venv/bin/python -m hermes_cli.main config get tool_loop_guardrails.hard_stop_enabled"
+      environment:
+        HERMES_HOME: "{{ home_dir }}/.hermes-{{ item }}"
+      loop: "{{ hermes_profiles_with_venv }}"
+      register: current_hard_stop
+      changed_when: false
+      failed_when: false
+
+    - name: "04-hermes-config | Enforce tool_loop_guardrails.hard_stop_enabled"
+      ansible.builtin.command:
+        cmd: "{{ home_dir }}/.hermes-{{ item }}/venv/bin/python -m hermes_cli.main config set tool_loop_guardrails.hard_stop_enabled true"
+      environment:
+        HERMES_HOME: "{{ home_dir }}/.hermes-{{ item }}"
+      loop: "{{ hermes_profiles_with_venv }}"
+      loop_control:
+        index_var: profile_idx
+      register: config_hard_stop
+      changed_when: current_hard_stop.results[profile_idx].stdout | default('') | trim | lower != 'true'
+      failed_when: config_hard_stop.rc != 0
+
+    # ── Stage 04b: fleet skills (optional) ──
+    - name: "04b-skills | Ensure skills directory exists for each seat"
+      ansible.builtin.file:
+        path: "{{ home_dir }}/.hermes-{{ item }}/skills"
+        state: directory
+        mode: "0755"
+      loop: "{{ hermes_profiles_with_venv }}"
+
+    - name: "04b-skills | Check whether the controller has a fleet skill tree"
+      ansible.builtin.stat:
+        path: "{{ controller_skills_dir }}"
+      register: controller_skills
+
+    - name: "04b-skills | Create fleet skills archive"
+      community.general.archive:
+        path: "{{ fleet_skill_dirs | map('regex_replace', '^', controller_skills_dir + '/') | list }}"
+        dest: /tmp/hermes_fleet_skills.tar.gz
+        format: gz
+        mode: "0644"
+      run_once: true
+      when: controller_skills.stat.exists | default(false)
+
+    - name: "04b-skills | Extract fleet skills into each seat"
+      ansible.builtin.unarchive:
+        src: /tmp/hermes_fleet_skills.tar.gz
+        dest: "{{ home_dir }}/.hermes-{{ item }}/skills/"
+        remote_src: false
+      loop: "{{ hermes_profiles_with_venv }}"
+      when:
+        - controller_skills.stat.exists | default(false)
+        - item != 'gmgrok'
+
+    - name: "04b-skills | Count SKILL.md per seat"
+      ansible.builtin.command:
+        cmd: "find {{ home_dir }}/.hermes-{{ item }}/skills -name SKILL.md | wc -l"
+      loop: "{{ hermes_profiles_with_venv }}"
+      register: seat_skills_count
+      changed_when: false
+
+    - name: "04b-skills | Report skills count per seat"
+      ansible.builtin.debug:
+        msg: "{{ item.item }}: {{ item.stdout | trim }} SKILL.md files"
+      loop: "{{ seat_skills_count.results }}"
+
+    # ── Stage 05: .env perms only (never write secrets) ──
+    - name: "05-vault | chmod 0600 existing .env files"
+      ansible.builtin.file:
+        path: "{{ home_dir }}/.hermes-{{ item }}/.env"
+        state: file
+        mode: "0600"
+      loop: "{{ hermes_profiles_all }}"
+      failed_when: false
+
+    # ── Stage 07: optional Firecrawl probe ──
+    - name: "07-verify | Check Firecrawl API root (opt-in)"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:3002/"
+        status_code: [200]
+      register: firecrawl_check
+      failed_when: false
+      when: firecrawl_required | default(false) | bool
+
+    - name: "07-verify | Assert Firecrawl is reachable"
+      ansible.builtin.assert:
+        that:
+          - firecrawl_check.status == 200
+        fail_msg: "Firecrawl on :3002 returned HTTP {{ firecrawl_check.status | default('offline') }}"
+        success_msg: "Firecrawl on :3002 is ONLINE"
+      when: firecrawl_required | default(false) | bool
+
+    - name: "07-verify | Report Firecrawl skipped"
+      ansible.builtin.debug:
+        msg: "Firecrawl check SKIPPED. Enable with -e firecrawl_required=true"
+      when: not (firecrawl_required | default(false) | bool)
+
+    # ── Stage 08: optional local knowledge-base probe ──
+    - name: "08-federation | Check local knowledge API (opt-in)"
+      ansible.builtin.uri:
+        url: "{{ arra_url }}"
+        status_code: [200]
+      register: arra_check
+      failed_when: false
+      when: arra_required | default(false) | bool
+
+    - name: "08-federation | Assert local knowledge API is reachable"
+      ansible.builtin.assert:
+        that:
+          - arra_check.status == 200
+        fail_msg: "{{ arra_url }} is unavailable"
+        success_msg: "{{ arra_url }} is ONLINE"
+      when: arra_required | default(false) | bool
+
+    - name: "08-federation | Report knowledge-API check skipped"
+      ansible.builtin.debug:
+        msg: "Knowledge API check SKIPPED. Enable with -e arra_required=true"
+      when: not (arra_required | default(false) | bool)

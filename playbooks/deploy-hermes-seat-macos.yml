@@ -1,0 +1,436 @@
+---
+# Job C — provision ONE additional Hermes seat on an existing macOS host.
+#
+# Unlike deploy-hermes-node.yml (Linux / systemd / one UNIX user), this
+# playbook adds a seat on a Mac that already has an admin account and a
+# shared hermes-agent checkout. Each seat gets:
+#   - its own HERMES_HOME (~/.hermes-<seat>/)
+#   - its own real venv (never a symlink to another seat)
+#   - its own launchd LaunchAgent (ai.hermes.gateway-<seat>.plist)
+#   - its own tmux socket (tmux -L <seat>) at runtime
+#
+# This does NOT create a separate macOS user per seat.
+#
+# Usage:
+#   ansible-playbook playbooks/deploy-hermes-seat-macos.yml \
+#     -e seat_name=myseat
+#
+# Optional:
+#   -e seat_enable_tui=false
+#   -e hermes_repo_dir=/path/to/NousResearch/hermes-agent
+#   -e controller_plugins_dir=/path/to/plugins
+
+- name: Provision a Hermes Agent seat on macOS
+  hosts: macos_hermes_hosts
+  connection: local
+  become: false
+  vars:
+    admin_user: "{{ ansible_env.USER | default('admin') }}"
+    admin_home: "{{ ansible_env.HOME | default('/Users/' + admin_user) }}"
+    seat_name: "REQUIRED"
+    hermes_home: "{{ admin_home }}/.hermes-{{ seat_name }}"
+    hermes_venv_dir: "{{ hermes_home }}/venv"
+    hermes_repo_dir: "{{ admin_home }}/Code/github.com/NousResearch/hermes-agent"
+    python_version: "3.11"
+    uv_bin: "{{ admin_home }}/.local/bin/uv"
+    launch_agents_dir: "{{ admin_home }}/Library/LaunchAgents"
+    gateway_label: "ai.hermes.gateway-{{ seat_name }}"
+    fleet_sender: "{{ ansible_hostname | default('macos') }}:{{ seat_name }}"
+    seat_path_env: "{{ hermes_venv_dir }}/bin:/usr/local/bin:{{ admin_home }}/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin:{{ admin_home }}/.local/bin"
+    seat_enable_tui: true
+    npm_required_major: "12"
+    controller_plugins_dir: "{{ admin_home }}/.hermes-gmgrok/plugins"
+    install_optional_plugins: true
+
+  tasks:
+    # -----------------------------------------------------------------
+    # 00: Preconditions
+    # -----------------------------------------------------------------
+    - name: Fail fast if seat_name was not provided
+      ansible.builtin.fail:
+        msg: "Pass -e seat_name=<name> (e.g. -e seat_name=no6). Refusing to run with the placeholder."
+      when: seat_name == "REQUIRED"
+
+    - name: Ensure the shared hermes-agent repo checkout exists
+      ansible.builtin.stat:
+        path: "{{ hermes_repo_dir }}/hermes_cli"
+      register: repo_check
+
+    - name: Fail if the shared repo checkout is missing
+      ansible.builtin.fail:
+        msg: >-
+          {{ hermes_repo_dir }} not found. Clone NousResearch/hermes-agent
+          once on this Mac, then re-run (or pass -e hermes_repo_dir=...).
+      when: not repo_check.stat.exists
+
+    - name: Ensure uv package manager is installed
+      ansible.builtin.stat:
+        path: "{{ uv_bin }}"
+      register: uv_check
+
+    - name: Download uv installer script (astral.sh)
+      ansible.builtin.get_url:
+        url: https://astral.sh/uv/install.sh
+        dest: "/tmp/uv-install-{{ seat_name }}.sh"
+        mode: "0755"
+      when: not uv_check.stat.exists
+
+    - name: Run uv installer
+      ansible.builtin.command:
+        cmd: "sh /tmp/uv-install-{{ seat_name }}.sh"
+      when: not uv_check.stat.exists
+      changed_when: true
+
+    # -----------------------------------------------------------------
+    # 01: HERMES_HOME
+    # -----------------------------------------------------------------
+    - name: Ensure HERMES_HOME directory exists
+      ansible.builtin.file:
+        path: "{{ hermes_home }}"
+        state: directory
+        mode: "0700"
+
+    - name: Ensure logs directory exists
+      ansible.builtin.file:
+        path: "{{ hermes_home }}/logs"
+        state: directory
+        mode: "0700"
+
+    # -----------------------------------------------------------------
+    # 02: Dedicated venv (refuse shared-symlink seats)
+    # -----------------------------------------------------------------
+    - name: Check whether venv exists and is a real directory
+      ansible.builtin.stat:
+        path: "{{ hermes_venv_dir }}"
+      register: venv_check
+
+    - name: Fail loudly if venv is a symlink
+      ansible.builtin.fail:
+        msg: >-
+          {{ hermes_venv_dir }} is a symlink to
+          {{ venv_check.stat.lnk_source | default('?') }}.
+          Stop the seat gateway, remove the symlink, then re-run.
+      when: venv_check.stat.exists and venv_check.stat.islnk | default(false)
+
+    - name: Create a dedicated venv for this seat
+      ansible.builtin.command:
+        cmd: "{{ uv_bin }} venv {{ hermes_venv_dir }} --python {{ python_version }}"
+        creates: "{{ hermes_venv_dir }}/bin/python"
+
+    - name: Install hermes-agent editable into this seat's venv
+      ansible.builtin.command:
+        cmd: "{{ uv_bin }} pip install --python {{ hermes_venv_dir }} -e \"{{ hermes_repo_dir }}[all]\""
+        creates: "{{ hermes_venv_dir }}/bin/hermes"
+      environment:
+        UV_NO_CONFIG: "1"
+
+    # -----------------------------------------------------------------
+    # 03: tmux socket isolation (runtime reminder)
+    # -----------------------------------------------------------------
+    - name: Note on tmux socket isolation
+      ansible.builtin.debug:
+        msg: >-
+          Open this seat with `tmux -L {{ seat_name }} new-session -s {{ seat_name }}`
+          so panes stay in their own socket namespace.
+
+    # -----------------------------------------------------------------
+    # 04: launchd LaunchAgent
+    # -----------------------------------------------------------------
+    - name: Install the Hermes Gateway LaunchAgent plist
+      ansible.builtin.copy:
+        dest: "{{ launch_agents_dir }}/{{ gateway_label }}.plist"
+        mode: "0644"
+        content: |
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>Label</key>
+              <string>{{ gateway_label }}</string>
+              <key>ProgramArguments</key>
+              <array>
+                  <string>{{ hermes_venv_dir }}/bin/python</string>
+                  <string>-m</string>
+                  <string>hermes_cli.main</string>
+                  <string>gateway</string>
+                  <string>run</string>
+                  <string>--replace</string>
+              </array>
+              <key>WorkingDirectory</key>
+              <string>{{ hermes_home }}</string>
+              <key>EnvironmentVariables</key>
+              <dict>
+                  <key>PATH</key>
+                  <string>{{ seat_path_env }}</string>
+                  <key>VIRTUAL_ENV</key>
+                  <string>{{ hermes_venv_dir }}</string>
+                  <key>HERMES_HOME</key>
+                  <string>{{ hermes_home }}</string>
+                  <key>HOME</key>
+                  <string>{{ admin_home }}</string>
+                  <key>HERMES_YOLO_MODE</key>
+                  <string>1</string>
+                  <key>FLEET_AGENT_NAME</key>
+                  <string>{{ seat_name }}</string>
+                  <key>MAW_SENDER</key>
+                  <string>{{ fleet_sender }}</string>
+              </dict>
+              <key>LimitLoadToSessionType</key>
+              <array>
+                  <string>Aqua</string>
+                  <string>Background</string>
+              </array>
+              <key>RunAtLoad</key>
+              <true/>
+              <key>KeepAlive</key>
+              <true/>
+              <key>ThrottleInterval</key>
+              <integer>30</integer>
+              <key>ExitTimeOut</key>
+              <integer>25</integer>
+              <key>StandardOutPath</key>
+              <string>{{ hermes_home }}/logs/gateway.log</string>
+              <key>StandardErrorPath</key>
+              <string>{{ hermes_home }}/logs/gateway.error.log</string>
+          </dict>
+          </plist>
+      notify: Reload launchd agent
+
+    # -----------------------------------------------------------------
+    # 04b: Node.js + npm engine gate, TUI bundle
+    # -----------------------------------------------------------------
+    - name: Check node is available (TUI prerequisite)
+      ansible.builtin.command:
+        cmd: node --version
+      register: node_version_check
+      changed_when: false
+      failed_when: false
+      when: seat_enable_tui | bool
+
+    - name: Fail with actionable guidance when node is missing
+      ansible.builtin.fail:
+        msg: >-
+          node not found but seat_enable_tui=true. Install it first
+          (`brew install node`), or set -e seat_enable_tui=false.
+      when:
+        - seat_enable_tui | bool
+        - node_version_check.rc != 0
+
+    - name: Read the installed npm version
+      ansible.builtin.command:
+        cmd: npm --version
+      register: npm_version_check
+      changed_when: false
+      failed_when: false
+      when: seat_enable_tui | bool
+
+    - name: Fail when npm sits in the engine-forbidden band
+      ansible.builtin.fail:
+        msg: >-
+          npm {{ npm_version_check.stdout | trim }} violates hermes-agent's
+          engines constraint "<11.10.0 || >=12.0.0". Fix with:
+          npm install -g npm@{{ npm_required_major }}
+      when:
+        - seat_enable_tui | bool
+        - npm_version_check.rc == 0
+        - npm_version_check.stdout is version('11.10.0', '>=')
+        - npm_version_check.stdout is version('12.0.0', '<')
+
+    - name: Install TUI workspace dependencies
+      ansible.builtin.command:
+        cmd: npm install --workspace ui-tui --include=dev
+        chdir: "{{ hermes_repo_dir }}"
+      register: tui_npm_install
+      changed_when: "'up to date' not in tui_npm_install.stdout"
+      when: seat_enable_tui | bool
+
+    - name: Build the TUI bundle (dist/entry.js)
+      ansible.builtin.command:
+        cmd: npm run build -w ui-tui
+        chdir: "{{ hermes_repo_dir }}"
+        creates: "{{ hermes_repo_dir }}/ui-tui/dist/entry.js"
+      when: seat_enable_tui | bool
+
+    - name: Read the seat's current chat interface
+      ansible.builtin.command:
+        cmd: "{{ hermes_venv_dir }}/bin/hermes config get display.interface"
+      environment:
+        HERMES_HOME: "{{ hermes_home }}"
+      register: tui_iface_current
+      changed_when: false
+      failed_when: false
+      when: seat_enable_tui | bool
+
+    - name: Select the TUI as this seat's chat interface
+      ansible.builtin.command:
+        cmd: "{{ hermes_venv_dir }}/bin/hermes config set display.interface tui"
+      environment:
+        HERMES_HOME: "{{ hermes_home }}"
+      when:
+        - seat_enable_tui | bool
+        - (tui_iface_current.stdout | default('') | trim) != 'tui'
+      changed_when: true
+
+    # -----------------------------------------------------------------
+    # 05: Verification
+    # -----------------------------------------------------------------
+    - name: Verify hermes CLI is reachable in the new venv
+      ansible.builtin.command:
+        cmd: "{{ hermes_venv_dir }}/bin/hermes --version"
+      environment:
+        HERMES_HOME: "{{ hermes_home }}"
+      register: hermes_version_output
+      changed_when: false
+
+    - name: Display version output
+      ansible.builtin.debug:
+        var: hermes_version_output.stdout_lines
+
+    - name: Confirm venv is NOT a symlink
+      ansible.builtin.stat:
+        path: "{{ hermes_venv_dir }}"
+      register: final_venv_check
+
+    - name: Fail if somehow still a symlink after provisioning
+      ansible.builtin.fail:
+        msg: "{{ hermes_venv_dir }} is still a symlink — isolation NOT achieved."
+      when: final_venv_check.stat.islnk | default(false)
+
+    - name: Verify the TUI bundle is present and non-empty
+      ansible.builtin.stat:
+        path: "{{ hermes_repo_dir }}/ui-tui/dist/entry.js"
+      register: tui_bundle_check
+      when: seat_enable_tui | bool
+
+    - name: Fail when the TUI bundle is missing or zero-length
+      ansible.builtin.fail:
+        msg: >-
+          ui-tui/dist/entry.js missing or empty. Re-run
+          `npm run build -w ui-tui` in {{ hermes_repo_dir }}.
+      when:
+        - seat_enable_tui | bool
+        - not (tui_bundle_check.stat.exists | default(false)) or
+          (tui_bundle_check.stat.size | default(0)) < 1024
+
+    - name: Confirm the seat resolves display.interface to tui
+      ansible.builtin.command:
+        cmd: "{{ hermes_venv_dir }}/bin/hermes config get display.interface"
+      environment:
+        HERMES_HOME: "{{ hermes_home }}"
+      register: tui_iface_check
+      changed_when: false
+      when: seat_enable_tui | bool
+
+    - name: Fail when the interface did not actually switch
+      ansible.builtin.fail:
+        msg: >-
+          display.interface resolved to
+          '{{ tui_iface_check.stdout | trim }}' instead of 'tui'.
+      when:
+        - seat_enable_tui | bool
+        - (tui_iface_check.stdout | default('') | trim) != 'tui'
+
+    # -----------------------------------------------------------------
+    # Stage 11 — TUI session health (warn-only)
+    # -----------------------------------------------------------------
+    - name: "Stage 11 | Count --resume flags on this seat's tmux panes"
+      ansible.builtin.shell: |
+        set -o pipefail
+        tmux list-panes -t "{{ seat_name }}" -F "#{pane_pid}" 2>/dev/null \
+          | xargs -I{} ps -p {} -o command= 2>/dev/null \
+          | grep -c "\-\-resume" || true
+      register: tui_resume_count
+      changed_when: false
+      failed_when: false
+
+    - name: "Stage 11 | Note if any pane uses --resume"
+      ansible.builtin.debug:
+        msg: >-
+          Seat {{ seat_name }} has {{ tui_resume_count.stdout | trim }}
+          pane(s) with --resume. After a shared-home migration this is
+          often intentional — Stage 12 checks whether the id is stale.
+      when: (tui_resume_count.stdout | default('0') | trim | int) > 0
+
+    - name: "Stage 11 | Check optional plugin sources on the controller"
+      ansible.builtin.stat:
+        path: "{{ controller_plugins_dir }}/{{ item }}/__init__.py"
+      loop:
+        - discord-display-mirror
+        - maw-relay
+      register: plugin_sources
+      when: install_optional_plugins | bool
+
+    - name: "Stage 11 | Copy optional plugins if the controller has them"
+      ansible.builtin.copy:
+        src: "{{ controller_plugins_dir }}/{{ item.item }}/"
+        dest: "{{ hermes_home }}/plugins/{{ item.item }}/"
+        mode: "0644"
+      loop: "{{ plugin_sources.results | default([]) }}"
+      when:
+        - install_optional_plugins | bool
+        - item.stat.exists | default(false)
+
+    - name: "Stage 11 | Verify tmux session exists for seat"
+      ansible.builtin.shell: |
+        tmux has-session -t "{{ seat_name }}" 2>/dev/null && echo exists || echo missing
+      register: tui_session_check
+      changed_when: false
+
+    - name: "Stage 11 | Warn if tmux session is missing"
+      ansible.builtin.debug:
+        msg: >-
+          tmux session '{{ seat_name }}' not found. Start with:
+          tmux new-session -d -s {{ seat_name }}
+          'HERMES_HOME={{ hermes_home }} {{ hermes_venv_dir }}/bin/hermes chat --tui'
+      when: tui_session_check.stdout | trim == "missing"
+
+    # -----------------------------------------------------------------
+    # Stage 12 — Shared-home / resume-target health (warn-only)
+    # -----------------------------------------------------------------
+    - name: "Stage 12 | Read the seat's newest discord session id"
+      ansible.builtin.shell: |
+        set -o pipefail
+        sqlite3 "{{ hermes_home }}/state.db" \
+          "select id from sessions where source='discord' order by started_at desc limit 1;" \
+          2>/dev/null || true
+      register: newest_discord_session
+      changed_when: false
+      failed_when: false
+
+    - name: "Stage 12 | Read the session id the TUI pane actually resumed"
+      ansible.builtin.shell: |
+        set -o pipefail
+        tmux list-panes -t "{{ seat_name }}" -F "#{pane_pid}" 2>/dev/null \
+          | head -1 \
+          | xargs -I{} ps -p {} -o command= 2>/dev/null \
+          | grep -o -- "--resume [^ ]*" \
+          | awk '{print $2}' || true
+      register: pane_resume_target
+      changed_when: false
+      failed_when: false
+
+    - name: "Stage 12 | Warn when the pane resumed a STALE session"
+      ansible.builtin.debug:
+        msg: >-
+          Pane resumed '{{ pane_resume_target.stdout | trim }}' but the
+          newest discord session is '{{ newest_discord_session.stdout | trim }}'.
+          Respawn the pane with the newer id.
+      when:
+        - (pane_resume_target.stdout | default('') | trim) != ''
+        - (newest_discord_session.stdout | default('') | trim) != ''
+        - (pane_resume_target.stdout | trim) != (newest_discord_session.stdout | trim)
+
+    - name: "Stage 12 | Summary"
+      ansible.builtin.debug:
+        msg: >-
+          Stage 12 ({{ seat_name }}):
+          resumed='{{ pane_resume_target.stdout | default('none') | trim }}'
+          newest='{{ newest_discord_session.stdout | default('none') | trim }}'
+
+  handlers:
+    - name: Reload launchd agent
+      ansible.builtin.shell: |
+        set -o pipefail
+        launchctl unload "{{ launch_agents_dir }}/{{ gateway_label }}.plist" 2>/dev/null || true
+        launchctl load "{{ launch_agents_dir }}/{{ gateway_label }}.plist"
+      changed_when: true
