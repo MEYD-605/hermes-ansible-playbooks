@@ -125,6 +125,56 @@
         UV_NO_CONFIG: "1"
 
     # -----------------------------------------------------------------
+    # 02b: Full optional-dependency coverage
+    #
+    # `[all]` only pulls 9 of the 44 declared extras. Everything else
+    # (anthropic, elevenlabs, exa, firecrawl, fal, mem0, supermemory,
+    # telegram, slack, feishu, dingtalk, matrix, modal, vercel, ...)
+    # stays MISSING until the day a feature is switched on — at which
+    # point the gateway raises ImportError at agent-init time and every
+    # message in that seat fails with "unexpected error", while the
+    # launchd job still reports healthy.
+    #
+    # Verified 2026-08-16 on maclab: flipping providers.<n>.api_mode to
+    # anthropic_messages produced 7 minutes of total DM outage purely
+    # because `anthropic` was absent from the seat venv.
+    #
+    # Installed one-by-one (not one big transaction) so a single
+    # platform-unavailable wheel cannot abort the whole batch.
+    # -----------------------------------------------------------------
+    - name: Determine which optional dependencies are missing from this venv
+      ansible.builtin.command:
+        cmd: >-
+          {{ hermes_venv_dir }}/bin/python
+          {{ playbook_dir }}/../scripts/install-optional-deps.py
+          --pyproject {{ hermes_repo_dir }}/pyproject.toml
+          --python {{ hermes_venv_dir }}/bin/python
+          --check
+      register: optional_deps_check
+      changed_when: false
+
+    - name: Install every optional dependency this seat is missing
+      ansible.builtin.command:
+        cmd: >-
+          {{ hermes_venv_dir }}/bin/python
+          {{ playbook_dir }}/../scripts/install-optional-deps.py
+          --pyproject {{ hermes_repo_dir }}/pyproject.toml
+          --python {{ hermes_venv_dir }}/bin/python
+      register: optional_deps_install
+      changed_when: (optional_deps_install.stdout | from_json).changed
+      when: (optional_deps_check.stdout | from_json).unavailable > 0
+
+    - name: Report optional dependency coverage for this seat
+      ansible.builtin.debug:
+        msg: >-
+          Optional deps: {{ _r.already_present }} already present,
+          {{ _r.newly_installed }} installed,
+          {{ _r.unavailable }} unavailable on this platform
+          {{ _r.unavailable_detail | map(attribute='spec') | list }}
+      vars:
+        _r: "{{ (optional_deps_install.stdout | default(optional_deps_check.stdout)) | from_json }}"
+
+    # -----------------------------------------------------------------
     # 03: tmux socket isolation (runtime reminder)
     # -----------------------------------------------------------------
     - name: Note on tmux socket isolation
