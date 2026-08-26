@@ -407,6 +407,14 @@
       loop:
         - discord-display-mirror
         - maw-relay
+        # shared-context-bridge mirrors turns between a seat's Discord gateway
+        # and its TUI/api_server lanes, so a seat dispatched over `maw hey` can
+        # be followed up by DM without re-explaining. Installed by hand on four
+        # seats and absent from this playbook until 2026-08-26 — every
+        # Ansible-deployed seat came up with no cross-lane memory and had to be
+        # patched afterwards. It reads HERMES_HOME (set in Stage 01) and now
+        # refuses to run rather than guessing a home.
+        - shared-context-bridge
       register: plugin_sources
       when: install_optional_plugins | bool
 
@@ -419,6 +427,49 @@
       when:
         - install_optional_plugins | bool
         - item.stat.exists | default(false)
+
+    # The controller copy above is the live source of truth, but a fresh
+    # machine may have no gmgrok seat to copy from. This repo vendors its own
+    # copy of shared-context-bridge so the playbook can stand alone; it is used
+    # only when the controller has nothing at that path.
+    - name: "Stage 11 | Fall back to the repo's vendored shared-context-bridge"
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../files/plugins/shared-context-bridge/"
+        dest: "{{ hermes_home }}/plugins/shared-context-bridge/"
+        mode: "0644"
+      when:
+        - install_optional_plugins | bool
+        # map(default=false) rather than selectattr('stat.exists'): a loop
+        # result whose stat never ran has no `stat` key at all, and a bare
+        # selectattr raises UndefinedError on it instead of reading as false.
+        - not (plugin_sources.results
+               | default([])
+               | selectattr('item', 'equalto', 'shared-context-bridge')
+               | map(attribute='stat.exists', default=false)
+               | select()
+               | list | length > 0)
+
+    # A copied plugin is not a working plugin: shared-context-bridge writes to
+    # $HERMES_HOME/shared_context and is inert if the launcher never exports
+    # HERMES_HOME. Stage 01 creates the dir and Stage 06 writes the plist, so
+    # by here both must agree. Check rather than assume.
+    - name: "Stage 11 | Confirm shared-context-bridge landed for this seat"
+      ansible.builtin.stat:
+        path: "{{ hermes_home }}/plugins/shared-context-bridge/__init__.py"
+      register: bridge_installed
+      when: install_optional_plugins | bool
+
+    - name: "Stage 11 | Warn if shared-context-bridge is missing"
+      ansible.builtin.debug:
+        msg: >-
+          shared-context-bridge NOT installed for {{ seat_name }}. This seat
+          will have no cross-lane context: work dispatched via `maw hey` will
+          not be visible when the same seat is followed up over Discord DM.
+          Neither {{ controller_plugins_dir }}/shared-context-bridge nor the
+          vendored copy in this repo could be read.
+      when:
+        - install_optional_plugins | bool
+        - not (bridge_installed.stat.exists | default(false))
 
     - name: "Stage 11 | Verify tmux session exists for seat"
       ansible.builtin.shell: |

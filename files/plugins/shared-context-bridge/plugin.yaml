@@ -1,0 +1,5 @@
+name: shared-context-bridge
+version: 1.0.0
+description: "Cross-lane Realtime Context Bridge: Mirrors Discord DMs & Fleet maw-hey events across Gateway and TUI without DB locks."
+author: No.4 MIMO & GMgrok
+enabled: true
